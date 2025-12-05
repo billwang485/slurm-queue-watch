@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+sqwatch - SLURM Queue Watch
+A lightweight terminal tool to monitor GPU partition queues on SLURM clusters.
+Helps you find the shortest queue to submit your jobs.
+
+Usage:
+    ./sqwatch              # Monitor with 5s refresh
+    ./sqwatch -i 3         # Custom refresh interval
+    ./sqwatch -1           # Run once and exit
+    ./sqwatch --partitions gpu,gpu_requeue  # Monitor specific partitions
+"""
+
+import subprocess
+import sys
+import time
+import argparse
+from datetime import datetime
+from collections import defaultdict
+
+class Colors:
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BLUE = '\033[94m'
+    RESET = '\033[0m'
+    BG_GREEN = '\033[42m'
+
+def run_cmd(cmd):
+    """Run shell command and return output."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            executable='/bin/bash'
+        )
+        return result.stdout.decode('utf-8').strip()
+    except:
+        return ""
+
+def detect_gpu_partitions():
+    """Auto-detect GPU partitions from the cluster."""
+    output = run_cmd("sinfo -o '%P %G' --noheader 2>/dev/null")
+    partitions = []
+    for line in output.split('\n'):
+        parts = line.split()
+        if len(parts) >= 2:
+            partition = parts[0].rstrip('*')
+            gres = parts[1]
+            # Check if partition has GPUs
+            if 'gpu' in gres.lower() or 'gpu' in partition.lower():
+                partitions.append(partition)
+    return list(set(partitions)) if partitions else ['gpu']
+
+def get_queue_stats(partitions):
+    """Get queue statistics for each partition."""
+    # Get all pending jobs
+    pending_output = run_cmd("squeue -t pending -o '%P' --noheader 2>/dev/null")
+    pending_counts = defaultdict(int)
+    for line in pending_output.split('\n'):
+        for p in line.strip().rstrip('*').split(','):
+            p = p.strip()
+            if p:
+                pending_counts[p] += 1
+
+    # Get all running jobs
+    running_output = run_cmd("squeue -t running -o '%P' --noheader 2>/dev/null")
+    running_counts = defaultdict(int)
+    for line in running_output.split('\n'):
+        for p in line.strip().rstrip('*').split(','):
+            p = p.strip()
+            if p:
+                running_counts[p] += 1
+
+    stats = {}
+    for partition in partitions:
+        stats[partition] = {
+            'pending': pending_counts.get(partition, 0),
+            'running': running_counts.get(partition, 0),
+        }
+    return stats
+
+def get_my_jobs():
+    """Get current user's jobs."""
+    output = run_cmd("squeue -u $USER --format='%i %P %j %T %M' --noheader 2>/dev/null")
+    jobs = []
+    for line in output.split('\n'):
+        if line.strip():
+            parts = line.split(maxsplit=4)
+            if len(parts) >= 4:
+                jobs.append({
+                    'id': parts[0],
+                    'partition': parts[1],
+                    'name': parts[2][:20],
+                    'state': parts[3],
+                    'time': parts[4] if len(parts) > 4 else '',
+                })
+    return jobs
+
+def get_color(pending):
+    if pending == 0:
+        return Colors.GREEN
+    elif pending < 10:
+        return Colors.CYAN
+    elif pending < 50:
+        return Colors.YELLOW
+    return Colors.RED
+
+def get_indicator(pending):
+    if pending == 0:
+        return f"{Colors.BG_GREEN} ✓ {Colors.RESET}"
+    elif pending < 10:
+        return f"{Colors.GREEN} ○ {Colors.RESET}"
+    elif pending < 50:
+        return f"{Colors.YELLOW} ◐ {Colors.RESET}"
+    return f"{Colors.RED} ● {Colors.RESET}"
+
+def display(stats, jobs):
+    """Display the monitor output."""
+    # Clear screen
+    print('\033[2J\033[H', end='')
+    
+    # Header
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{Colors.BOLD}{Colors.CYAN}")
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║              🖥️  SLURM Queue Watch (sqwatch)              ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
+    print(f"{Colors.RESET}")
+    print(f"{Colors.DIM}Updated: {now}  |  Ctrl+C to exit{Colors.RESET}\n")
+
+    # Queue table (sorted by pending)
+    sorted_parts = sorted(stats.items(), key=lambda x: x[1]['pending'])
+    
+    print(f"{Colors.BOLD}📊 Queues (shortest first):{Colors.RESET}\n")
+    print(f"  {'Partition':<25} {'Status':<8} {'Pending':<10} {'Running':<10}")
+    print(f"  {'-'*25} {'-'*8} {'-'*10} {'-'*10}")
+    
+    for i, (partition, data) in enumerate(sorted_parts):
+        pending = data['pending']
+        running = data['running']
+        color = get_color(pending)
+        indicator = get_indicator(pending)
+        
+        prefix = Colors.BOLD if i < 3 and pending < 50 else ""
+        suffix = Colors.RESET if prefix else ""
+        
+        print(f"  {prefix}{partition:<25}{suffix} {indicator} "
+              f"{color}{pending:>6}{Colors.RESET}     "
+              f"{Colors.BLUE}{running:>6}{Colors.RESET}")
+    
+    # My jobs
+    print(f"\n{Colors.BOLD}👤 My Jobs:{Colors.RESET}\n")
+    if not jobs:
+        print(f"  {Colors.DIM}No active jobs{Colors.RESET}")
+    else:
+        for job in jobs[:8]:
+            state_color = Colors.GREEN if job['state'] == 'RUNNING' else Colors.YELLOW
+            print(f"  {job['id']:<12} {job['partition']:<20} "
+                  f"{state_color}{job['state']:<10}{Colors.RESET} {job['time']}")
+        if len(jobs) > 8:
+            print(f"  {Colors.DIM}... +{len(jobs)-8} more{Colors.RESET}")
+    
+    # Recommendation
+    if sorted_parts:
+        best = sorted_parts[0]
+        print(f"\n{Colors.GREEN}💡 Shortest queue: {Colors.BOLD}{best[0]}{Colors.RESET} "
+              f"({best[1]['pending']} pending){Colors.RESET}\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Monitor SLURM GPU queue status',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: ./sqwatch -i 3 --partitions gpu,gpu_requeue'
+    )
+    parser.add_argument('-i', '--interval', type=int, default=5,
+                        help='Refresh interval in seconds (default: 5)')
+    parser.add_argument('-1', '--once', action='store_true',
+                        help='Run once and exit')
+    parser.add_argument('-p', '--partitions', type=str, default='',
+                        help='Comma-separated list of partitions to monitor')
+    args = parser.parse_args()
+
+    # Get partitions
+    if args.partitions:
+        partitions = [p.strip() for p in args.partitions.split(',')]
+    else:
+        partitions = detect_gpu_partitions()
+
+    try:
+        while True:
+            stats = get_queue_stats(partitions)
+            jobs = get_my_jobs()
+            display(stats, jobs)
+            
+            if args.once:
+                break
+            
+            print(f"{Colors.DIM}Refreshing in {args.interval}s...{Colors.RESET}")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"\n{Colors.CYAN}Bye!{Colors.RESET}")
+
+if __name__ == '__main__':
+    main()
+
