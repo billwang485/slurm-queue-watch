@@ -122,8 +122,8 @@ def get_indicator(pending):
 
 def display(stats, jobs):
     """Display the monitor output."""
-    # Clear screen
-    print('\033[2J\033[H', end='')
+    # Clear screen and scrollback buffer
+    print('\033[3J\033[2J\033[H', end='', flush=True)
     
     # Header
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
